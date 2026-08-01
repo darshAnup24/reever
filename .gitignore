@@ -1,0 +1,11 @@
+node_modules/
+dist/
+*.log
+.env
+.env.*
+!.env.example
+
+# Installed agent skills (local; reinstall with `bunx skills add …`)
+/.agents/
+/agent/
+skills-lock.json
