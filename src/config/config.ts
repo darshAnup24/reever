@@ -1,0 +1,711 @@
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
+import type { IsolationMode } from "../agent/isolation.js";
+import type { SessionIsolationMode } from "../agent/session-isolation.js";
+
+export interface ModelPricing {
+  inputPerM: number;
+  outputPerM: number;
+  cacheReadPerM?: number;
+  cacheWritePerM?: number;
+}
+
+/** User overrides for a provider's model slots (absent key = no override). */
+export interface ProviderModelSlots {
+  main?: string;
+  explore?: string;
+  review?: string;
+  implement?: string;
+  delegate_read?: string;
+  compaction?: string;
+  pickerExtras?: string[];
+}
+
+export type ModelSlot = keyof Omit<ProviderModelSlots, "pickerExtras">;
+
+/** One candidate in a routed chain for a model slot. */
+export interface RoutingChainEntry {
+  provider: string;
+  model?: string;
+  priority: number;
+}
+
+/** Per-slot routing chains for a named profile (slot name → ordered candidates). */
+export type RoutingTaskRoutes = Partial<Record<ModelSlot, RoutingChainEntry[]>>;
+
+export interface RoutingProfile {
+  taskRoutes: RoutingTaskRoutes;
+}
+
+export interface RoutingConfig {
+  /** Master switch — when false, `streamAssistant` resolves the active provider exactly as today. */
+  enabled: boolean;
+  /** Named profile used to resolve chains; falls back to entries-in-config when absent. */
+  profile: string;
+  profiles: Record<string, RoutingProfile>;
+  retryAttempts: number;
+  backoffMs: number;
+  circuitBreaker: {
+    failureThreshold: number;
+    cooldownSeconds: number;
+  };
+}
+
+/** Budget ceiling actions that gate LLM calls via the router. */
+export type BudgetExceedAction = "abort" | "downgrade_model";
+
+export interface BudgetConfig {
+  /** Ceiling in USD per session; undefined/0 disables enforcement. */
+  maxUsdPerRun?: number;
+  /** Action when the ceiling is exceeded on the routed path. */
+  actionOnExceed: BudgetExceedAction;
+}
+
+/** OTLP trace exporter settings. Resolved by `resolveOtelConfig()`. */
+export interface OtelConfig {
+  /** When false, the OTel subtree is never loaded. Auto-enabled if an endpoint is present. */
+  enabled: boolean;
+  /** OTLP/HTTP traces endpoint, e.g. `https://cloud.langfuse.com/api/public/otel/v1/traces`. */
+  endpoint: string;
+  protocol: string;
+  headers: Record<string, string>;
+  serviceName: string;
+  /** Semantic-convention flavour; only `genai` is implemented today. */
+  semconv: string;
+  /** Capture prompt/response content on spans (privacy-sensitive; tuned in 7/8). */
+  captureContent: boolean;
+  sampleRatio: number;
+  /** Stable anonymous OTLP user id — auto-generated on first export when absent. */
+  userId?: string;
+}
+
+export interface Config {
+  provider: {
+    active: string;
+    openrouter?: { apiKey?: string };
+    anthropic?: { apiKey?: string };
+    openai?: { apiKey?: string };
+    litellm?: { baseUrl?: string };
+    vercel?: { apiKey?: string };
+    cloudflare?: { apiKey?: string; accountId?: string; gatewayId?: string };
+    regolo?: { apiKey?: string };
+    cerebras?: { apiKey?: string };
+    opencode?: { apiKey?: string };
+    "command-code"?: { apiKey?: string };
+    /** Local Ollama server. No API key is required. */
+    ollama?: { baseUrl?: string };
+  };
+  models: {
+    /** Per-provider model slot overrides — only keys the user has set. */
+    providers: Record<string, Partial<ProviderModelSlots>>;
+    contextWindows: Record<string, number>;
+    pricing: Record<string, ModelPricing>;
+  };
+  approval: {
+    mode: "normal" | "auto-accept" | "plan";
+    autoApprovedCommands: string[];
+  };
+  subagent: {
+    /**
+     * Default isolation floor for mutating `task` subagents. A guarantee, not
+     * just a default: the lead model may escalate to a more-isolated mode per
+     * call but never weaken below this. Read-only presets are unaffected.
+     */
+    isolation: IsolationMode;
+    /**
+     * Maximum number of `task_parallel` children that run concurrently. Bounds
+     * the fan-out cost (each mutating child boots its own git worktree); extra
+     * tasks queue until a slot frees. Floored at 1.
+     */
+    maxParallel: number;
+  };
+  /** Per-turn circuit breaker for the main agent loop (not subagents). */
+  agent: {
+    /** Max assistant rounds per user turn; 0 disables the cap. */
+    maxTurns: number;
+    /** Max cumulative tool calls per user turn; 0 disables the cap. */
+    maxToolCalls: number;
+  };
+  session: {
+    /** Whole-session parent-loop isolation. Default `shared`. */
+    isolation: SessionIsolationMode;
+  };
+  system: {
+    prompt: string;
+  };
+  telemetry: {
+    enabled: boolean;
+    /** Echo each metric event to stdout (debugging). */
+    stdout: boolean;
+    metricsFile: string;
+    /** OTLP trace export (issue 5/8). Off unless an endpoint is configured. */
+    otel: OtelConfig;
+  };
+  sandbox?: {
+    active?: "local" | "e2b";
+    e2b?: { apiKey?: string };
+  };
+  todo?: {
+    /** Write `.reever/todo.md` on each todowrite call for human-editable, committable plans. */
+    export?: boolean;
+  };
+  /** Ratel context engine — ranked tool/skill catalogs (issue #295). */
+  ratel?: {
+    enabled?: boolean;
+    topKTools?: number;
+    topKSkills?: number;
+    pinnedTools?: string[];
+    controlFraction?: number;
+  };
+  tools?: {
+    exa?: { apiKey?: string };
+    /** When true, fetch may reach loopback hosts on the local workspace only. */
+    fetch?: { allowLocalhost?: boolean };
+    edit?: {
+      /** Block edit/write until the file is re-read after external changes. */
+      requireFreshRead?: boolean;
+    };
+  };
+  /** Provider routing chains + failover/circuit-breaker tuning. */
+  routing?: RoutingConfig;
+  /** Per-session spend ceiling enforced at the router layer. */
+  budget?: BudgetConfig;
+}
+
+type DeepPartial<T> = T extends object
+  ? { [K in keyof T]?: DeepPartial<T[K]> }
+  : T;
+
+const DEFAULT_CONFIG: Config = {
+  provider: { active: "openrouter" },
+  models: {
+    providers: {},
+    contextWindows: {
+      "anthropic/claude-opus-4.8": 200000,
+      "anthropic/claude-sonnet-4.6": 200000,
+      "anthropic/claude-sonnet-4": 200000,
+      "google/gemini-3.5-flash": 1000000,
+      "google/gemini-3.1-flash-lite": 1000000,
+      "deepseek/deepseek-v4-pro": 64000,
+      "deepseek/deepseek-v4-flash": 64000,
+      "moonshotai/kimi-k2.7-code": 131072,
+    },
+    pricing: {
+      // Local Ollama inference has no per-token charge. Provider-qualified
+      // keys avoid incorrectly pricing a similarly named hosted model at $0.
+      "ollama/qwen2.5-coder:14b": { inputPerM: 0, outputPerM: 0 },
+      "ollama/qwen2.5-coder:7b": { inputPerM: 0, outputPerM: 0 },
+      "ollama/llama3.1:8b": { inputPerM: 0, outputPerM: 0 },
+      "ollama/deepseek-r1:8b": { inputPerM: 0, outputPerM: 0 },
+      "anthropic/claude-sonnet-4": { inputPerM: 3.0, outputPerM: 15.0, cacheReadPerM: 0.3, cacheWritePerM: 3.75 },
+      "anthropic/claude-sonnet-4.6": { inputPerM: 3.0, outputPerM: 15.0, cacheReadPerM: 0.3, cacheWritePerM: 3.75 },
+      "anthropic/claude-opus-4.8": { inputPerM: 15.0, outputPerM: 75.0, cacheReadPerM: 1.5, cacheWritePerM: 18.75 },
+      "claude-sonnet-4-6": { inputPerM: 3.0, outputPerM: 15.0, cacheReadPerM: 0.3, cacheWritePerM: 3.75 },
+      "claude-sonnet-4-5": { inputPerM: 3.0, outputPerM: 15.0, cacheReadPerM: 0.3, cacheWritePerM: 3.75 },
+      "claude-opus-4-8": { inputPerM: 15.0, outputPerM: 75.0, cacheReadPerM: 1.5, cacheWritePerM: 18.75 },
+      "claude-opus-4-7": { inputPerM: 15.0, outputPerM: 75.0, cacheReadPerM: 1.5, cacheWritePerM: 18.75 },
+      "claude-haiku-4-5": { inputPerM: 1.0, outputPerM: 5.0, cacheReadPerM: 0.1, cacheWritePerM: 1.25 },
+      "deepseek/deepseek-v4-flash": { inputPerM: 0.14, outputPerM: 0.28, cacheReadPerM: 0.014 },
+      "deepseek/deepseek-v4-pro": { inputPerM: 0.27, outputPerM: 1.1, cacheReadPerM: 0.027 },
+      "minimax/minimax-m3": { inputPerM: 0.3, outputPerM: 1.2, cacheReadPerM: 0.06 },
+      "google/gemini-3.5-flash": { inputPerM: 0.15, outputPerM: 0.6, cacheReadPerM: 0.0375 },
+      "google/gemini-3.1-flash-lite": { inputPerM: 0.075, outputPerM: 0.30, cacheReadPerM: 0.01875 },
+      "moonshotai/kimi-k2.7-code": { inputPerM: 0.15, outputPerM: 0.6, cacheReadPerM: 0.075 },
+      "z-ai/glm-5.2": { inputPerM: 0.40, outputPerM: 1.60 },
+      "z-ai/glm-5.1": { inputPerM: 0.40, outputPerM: 1.60 },
+      "qwen/qwen3.7-plus": { inputPerM: 0.40, outputPerM: 2.40 },
+      "xiaomi/mimo-v2.5-pro": { inputPerM: 0.10, outputPerM: 0.30 },
+      "inception/mercury-2": { inputPerM: 0.25, outputPerM: 1.00 },
+      "arcee-ai/trinity-large-thinking": { inputPerM: 0.15, outputPerM: 0.60 },
+      "mistralai/mistral-large-2512": { inputPerM: 2.00, outputPerM: 6.00 },
+      "Llama-3.3-70B-Instruct": { inputPerM: 0.59, outputPerM: 0.79 },
+      "qwen3-coder-next": { inputPerM: 0.22, outputPerM: 1.00 },
+      "qwen3.5-122b": { inputPerM: 0.22, outputPerM: 0.88 },
+      "qwen3.6-27b": { inputPerM: 0.10, outputPerM: 0.40 },
+      "gpt-oss-120b": { inputPerM: 0.15, outputPerM: 0.60 },
+      "mistral-small-4-119b": { inputPerM: 0.10, outputPerM: 0.30 },
+      "gemma4-31b": { inputPerM: 0.07, outputPerM: 0.25 },
+    },
+  },
+  approval: { mode: "normal", autoApprovedCommands: [] },
+  subagent: { isolation: "shared", maxParallel: 4 },
+  agent: { maxTurns: 25, maxToolCalls: 50 },
+  session: { isolation: "shared" },
+  system: {
+    prompt:
+      "You are Reever, a coding agent. Use tools to inspect and modify the codebase. Answer concisely. "
+      + "Prefer automated tests over starting dev servers; bash blocks on foreground long-running processes.",
+  },
+  ratel: { enabled: true },
+  telemetry: {
+    enabled: true,
+    stdout: false,
+    metricsFile: "~/.reever/metrics.jsonl",
+    otel: {
+      enabled: false,
+      endpoint: "",
+      protocol: "http/protobuf",
+      headers: {},
+      serviceName: "reever",
+      semconv: "genai",
+      captureContent: false,
+      sampleRatio: 1.0,
+    },
+  },
+  routing: {
+    enabled: false,
+    profile: "balanced",
+    profiles: {},
+    retryAttempts: 2,
+    backoffMs: 1_000,
+    circuitBreaker: { failureThreshold: 3, cooldownSeconds: 120 },
+  },
+  budget: { actionOnExceed: "abort" },
+};
+
+function configPath(): string {
+  return join(homedir(), ".reever", "config.json");
+}
+
+function deepMerge(base: Record<string, unknown>, patch: Record<string, unknown>): Record<string, unknown> {
+  const result: Record<string, unknown> = { ...base };
+  for (const key of Object.keys(patch)) {
+    const pv = patch[key];
+    if (pv === undefined) continue;
+    const bv = base[key];
+    if (
+      typeof pv === "object" && pv !== null && !Array.isArray(pv) &&
+      typeof bv === "object" && bv !== null && !Array.isArray(bv)
+    ) {
+      result[key] = deepMerge(bv as Record<string, unknown>, pv as Record<string, unknown>);
+    } else {
+      result[key] = pv;
+    }
+  }
+  return result;
+}
+
+function readRawConfig(): Record<string, unknown> {
+  const path = configPath();
+  if (!existsSync(path)) return {};
+  try {
+    const raw = readFileSync(path, "utf8").trim();
+    if (!raw) return {};
+    return JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    return {};
+  }
+}
+
+/** Write the default config file when missing or empty so users have something to edit. */
+export function ensureConfigFile(): boolean {
+  const path = configPath();
+  const dir = dirname(path);
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+
+  if (!existsSync(path)) {
+    saveConfig({});
+    return true;
+  }
+
+  const raw = readFileSync(path, "utf8").trim();
+  if (!raw) {
+    saveConfig({});
+    return true;
+  }
+
+  return false;
+}
+
+function normalizePickerConfig(raw: unknown): Record<string, string[]> {
+  if (Array.isArray(raw)) {
+    return { openrouter: raw.filter((id): id is string => typeof id === "string") };
+  }
+  if (raw && typeof raw === "object") {
+    const next: Record<string, string[]> = {};
+    for (const [providerId, models] of Object.entries(raw as Record<string, unknown>)) {
+      if (Array.isArray(models)) {
+        next[providerId] = models.filter((id): id is string => typeof id === "string");
+      }
+    }
+    return next;
+  }
+  return {};
+}
+
+/**
+ * Normalize `models.roles` into the provider-scoped shape `providerId → role →
+ * model`. Tolerates the legacy flat shape (`role → model`, written before role
+ * overrides were provider-aware) by attributing those entries to the active
+ * provider — the provider they were implicitly set under. Mixed shapes are
+ * handled per top-level key: string values are legacy role entries, object
+ * values are already provider-scoped. Role ids (`explore`/`review`/`implement`)
+ * never collide with provider ids, so the value type disambiguates safely.
+ */
+function normalizeRolesConfig(raw: unknown, activeProvider: string): Record<string, Record<string, string>> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const result: Record<string, Record<string, string>> = {};
+  const put = (providerId: string, role: string, model: string) => {
+    const trimmed = model.trim();
+    if (!trimmed) return;
+    (result[providerId] ??= {})[role] = trimmed;
+  };
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof value === "string") {
+      put(activeProvider, key, value);
+    } else if (value && typeof value === "object" && !Array.isArray(value)) {
+      for (const [role, model] of Object.entries(value as Record<string, unknown>)) {
+        if (typeof model === "string") put(key, role, model);
+      }
+    }
+  }
+  return result;
+}
+
+/** Picker lists shipped in older releases; cleared so bundled provider defaults apply. */
+const LEGACY_OPENROUTER_PICKER_LISTS: ReadonlyArray<readonly string[]> = [
+  [
+    "anthropic/claude-opus-4.8",
+    "anthropic/claude-sonnet-4.6",
+    "google/gemini-3.5-flash",
+    "google/gemini-3.1-flash-lite",
+    "deepseek/deepseek-v4-pro",
+    "minimax/minimax-m3",
+    "z-ai/glm-5.1",
+    "inception/mercury-2",
+    "arcee-ai/trinity-large-thinking",
+    "mistralai/mistral-large-2512",
+  ],
+  [
+    "anthropic/claude-opus-4.8",
+    "anthropic/claude-sonnet-4.6",
+    "google/gemini-3.5-flash",
+    "google/gemini-3.1-flash-lite",
+    "deepseek/deepseek-v4-pro",
+    "deepseek/deepseek-v4-flash",
+    "minimax/minimax-m3",
+    "z-ai/glm-5.1",
+    "inception/mercury-2",
+    "arcee-ai/trinity-large-thinking",
+    "mistralai/mistral-large-2512",
+  ],
+];
+
+let cachedConfig: Config | undefined;
+
+function pickerMatchesLegacyList(models: string[], legacy: readonly string[]): boolean {
+  if (models.length !== legacy.length) return false;
+  const set = new Set(models);
+  return legacy.every((id) => set.has(id));
+}
+
+function dropLegacyPickerOverrides(picker: Record<string, string[]>): Record<string, string[]> {
+  const openrouter = picker.openrouter;
+  if (!openrouter?.length) return picker;
+  const isLegacy = LEGACY_OPENROUTER_PICKER_LISTS.some((legacy) =>
+    pickerMatchesLegacyList(openrouter, legacy),
+  );
+  if (!isLegacy) return picker;
+  const { openrouter: _removed, ...rest } = picker;
+  return rest;
+}
+
+function migrateModelsConfig(
+  raw: Record<string, unknown>,
+  activeProvider: string,
+): Record<string, Partial<ProviderModelSlots>> {
+  const rawModels = (raw.models ?? {}) as Record<string, unknown>;
+  const existing = (rawModels.providers ?? {}) as Record<string, Partial<ProviderModelSlots>>;
+  const providers: Record<string, Partial<ProviderModelSlots>> = structuredClone(existing);
+
+  const ensure = (id: string): Partial<ProviderModelSlots> => {
+    if (!providers[id]) providers[id] = {};
+    return providers[id]!;
+  };
+
+  const globalMain = typeof rawModels.main === "string" ? rawModels.main.trim() : "";
+  const globalCheap = typeof rawModels.cheap === "string" ? rawModels.cheap.trim() : "";
+
+  const roles = normalizeRolesConfig(rawModels.roles, activeProvider);
+  for (const [providerId, roleMap] of Object.entries(roles)) {
+    const slot = ensure(providerId);
+    for (const [role, model] of Object.entries(roleMap)) {
+      if (role === "explore" && !slot.explore) slot.explore = model;
+      else if (role === "review" && !slot.review) slot.review = model;
+      else if (role === "implement" && !slot.implement) slot.implement = model;
+    }
+  }
+
+  const picker = dropLegacyPickerOverrides(normalizePickerConfig(rawModels.picker));
+  for (const [providerId, extras] of Object.entries(picker)) {
+    if (extras.length && !ensure(providerId).pickerExtras?.length) {
+      ensure(providerId).pickerExtras = extras;
+    }
+  }
+
+  const lastUsed = (rawModels.lastUsed ?? {}) as Record<string, { main?: string; cheap?: string }>;
+  for (const [providerId, entry] of Object.entries(lastUsed)) {
+    if (!entry || typeof entry !== "object") continue;
+    const slot = ensure(providerId);
+    if (entry.main?.trim() && !slot.main) slot.main = entry.main.trim();
+    const cheap = entry.cheap?.trim() || globalCheap;
+    if (cheap) {
+      if (!slot.delegate_read) slot.delegate_read = cheap;
+      if (!slot.compaction) slot.compaction = cheap;
+    }
+  }
+
+  if (globalMain && !ensure(activeProvider).main) {
+    ensure(activeProvider).main = globalMain;
+  }
+  if (globalCheap) {
+    const slot = ensure(activeProvider);
+    if (!slot.delegate_read) slot.delegate_read = globalCheap;
+    if (!slot.compaction) slot.compaction = globalCheap;
+  }
+
+  for (const id of Object.keys(providers)) {
+    if (Object.keys(providers[id]!).length === 0) delete providers[id];
+  }
+
+  return providers;
+}
+
+function buildConfig(): Config {
+  const raw = readRawConfig();
+  const merged = deepMerge(
+    DEFAULT_CONFIG as unknown as Record<string, unknown>,
+    raw,
+  ) as unknown as Config;
+
+  merged.models.providers = migrateModelsConfig(raw, merged.provider.active);
+
+  // A concurrency cap below 1 would deadlock the fan-out pool; clamp to a sane
+  // floor. An explicit numeric value (including 0) clamps to 1; only a missing or
+  // non-numeric setting falls back to the default.
+  const maxParallel = Number(merged.subagent.maxParallel);
+  merged.subagent.maxParallel = Number.isFinite(maxParallel)
+    ? Math.max(1, Math.floor(maxParallel))
+    : DEFAULT_CONFIG.subagent.maxParallel;
+
+  const maxTurns = Number(merged.agent?.maxTurns);
+  const maxToolCalls = Number(merged.agent?.maxToolCalls);
+  merged.agent = {
+    maxTurns: Number.isFinite(maxTurns) && maxTurns >= 0
+      ? Math.floor(maxTurns)
+      : DEFAULT_CONFIG.agent.maxTurns,
+    maxToolCalls: Number.isFinite(maxToolCalls) && maxToolCalls >= 0
+      ? Math.floor(maxToolCalls)
+      : DEFAULT_CONFIG.agent.maxToolCalls,
+  };
+
+  // Routing: tolerate malformed user config by clamping retry fields to the
+  // defaults. `enabled` stays opt-in via config; profiles may be partially
+  // specified (a missing slot means "use the active-provider default").
+  const routingDefault = DEFAULT_CONFIG.routing as NonNullable<Config["routing"]>;
+  const retryAttempts = Number(merged.routing?.retryAttempts);
+  const backoffMs = Number(merged.routing?.backoffMs);
+  const threshold = Number(merged.routing?.circuitBreaker?.failureThreshold);
+  const cooldown = Number(merged.routing?.circuitBreaker?.cooldownSeconds);
+  merged.routing = {
+    enabled: merged.routing?.enabled === true,
+    profile: merged.routing?.profile?.trim() || routingDefault.profile,
+    profiles: merged.routing?.profiles ?? {},
+    retryAttempts: Number.isFinite(retryAttempts) && retryAttempts >= 0
+      ? Math.floor(retryAttempts)
+      : routingDefault.retryAttempts,
+    backoffMs: Number.isFinite(backoffMs) && backoffMs >= 0
+      ? Math.floor(backoffMs)
+      : routingDefault.backoffMs,
+    circuitBreaker: {
+      failureThreshold: Number.isFinite(threshold) && threshold > 0
+        ? Math.floor(threshold)
+        : routingDefault.circuitBreaker.failureThreshold,
+      cooldownSeconds: Number.isFinite(cooldown) && cooldown > 0
+        ? Math.floor(cooldown)
+        : routingDefault.circuitBreaker.cooldownSeconds,
+    },
+  };
+
+  // Budget: only enforce when a finite, positive ceiling exists. The action
+  // falls back to `abort` for any unrecognised value.
+  const ceiling = Number(merged.budget?.maxUsdPerRun);
+  merged.budget = {
+    maxUsdPerRun: Number.isFinite(ceiling) && ceiling > 0 ? ceiling : undefined,
+    actionOnExceed:
+      merged.budget?.actionOnExceed === "downgrade_model" ? "downgrade_model" : "abort",
+  };
+
+  return merged;
+}
+
+/** Main-loop caps from config; 0 means unlimited (cap disabled). */
+export function resolveMainLoopLimits(): { maxTurns?: number; maxToolCalls?: number } {
+  const { maxTurns, maxToolCalls } = loadConfig().agent;
+  return {
+    maxTurns: maxTurns > 0 ? maxTurns : undefined,
+    maxToolCalls: maxToolCalls > 0 ? maxToolCalls : undefined,
+  };
+}
+
+/** Load config: defaults merged with `~/.reever/config.json`. Cached for performance. */
+export function loadConfig(): Config {
+  if (cachedConfig === undefined) {
+    cachedConfig = buildConfig();
+  }
+  return cachedConfig;
+}
+
+/** Invalidate the config cache. Used after config file changes or explicit reload. */
+export function reloadConfig(): Config {
+  cachedConfig = undefined;
+  return loadConfig();
+}
+
+/** Internal: Clear the config cache for testing. */
+export function __testClearCache(): void {
+  cachedConfig = undefined;
+}
+
+/** True when an OpenRouter API key is set in config. */
+export function hasOpenRouterApiKey(): boolean {
+  return Boolean(loadConfig().provider.openrouter?.apiKey?.trim());
+}
+
+/** True when a Regolo API key is set in config. */
+export function hasRegoloApiKey(): boolean {
+  return Boolean(loadConfig().provider.regolo?.apiKey?.trim());
+}
+
+/** True when a Cerebras API key is set in config. */
+export function hasCerebrasApiKey(): boolean {
+  return Boolean(loadConfig().provider.cerebras?.apiKey?.trim());
+}
+
+/** True when an OpenAI API key is set in config. */
+export function hasOpenAiApiKey(): boolean {
+  return Boolean(loadConfig().provider.openai?.apiKey?.trim());
+}
+
+/** True when an Anthropic API key is set in config. */
+export function hasAnthropicApiKey(): boolean {
+  return Boolean(loadConfig().provider.anthropic?.apiKey?.trim());
+}
+
+/** True when an Opencode API key is set in config. */
+export function hasOpencodeApiKey(): boolean {
+  return Boolean(loadConfig().provider.opencode?.apiKey?.trim());
+}
+
+/** True when an E2B API key is set in config. */
+export function hasE2BApiKey(): boolean {
+  return Boolean(loadConfig().sandbox?.e2b?.apiKey?.trim());
+}
+
+/** Exa API key from config; undefined when not configured. */
+export function getExaApiKey(): string | undefined {
+  const key = loadConfig().tools?.exa?.apiKey?.trim();
+  return key || undefined;
+}
+
+/** True when an Exa API key is set in config. */
+export function hasExaApiKey(): boolean {
+  return Boolean(getExaApiKey());
+}
+
+/** Persist an E2B API key under `sandbox.e2b.apiKey` in config.json. */
+export function saveE2BApiKey(apiKey: string): void {
+  const trimmed = apiKey.trim();
+  if (!trimmed) return;
+  saveConfig({ sandbox: { e2b: { apiKey: trimmed } } });
+  cachedConfig = undefined;
+}
+
+/** True when fetch may reach loopback hosts (local workspace only; see fetch tool). */
+export function isFetchLocalhostAllowed(): boolean {
+  return loadConfig().tools?.fetch?.allowLocalhost === true;
+}
+
+/** Persist an Exa API key under `tools.exa.apiKey` in config.json. */
+export function saveExaApiKey(apiKey: string): void {
+  const trimmed = apiKey.trim();
+  if (!trimmed) return;
+  saveConfig({ tools: { exa: { apiKey: trimmed } } });
+  cachedConfig = undefined;
+}
+
+/**
+ * Persist provider-specific settings under `provider.<section>.<key>` in
+ * config.json. `section` defaults to `providerId` when omitted.
+ */
+export function saveProviderConfig(
+  providerId: string,
+  values: Record<string, string>,
+  configSection?: string,
+): void {
+  const section: Record<string, string> = {};
+  for (const [key, value] of Object.entries(values)) {
+    const trimmed = value.trim();
+    if (trimmed) section[key] = trimmed;
+  }
+  saveConfig({ provider: { [configSection ?? providerId]: section } } as DeepPartial<Config>);
+  cachedConfig = undefined;
+}
+
+/**
+ * Set or clear a model slot override for a provider under `models.providers`.
+ * Passing an empty value or `"default"` removes the override so the slot falls
+ * back to bundled defaults via `resolveProviderSlot`.
+ */
+export function saveProviderModelSlot(
+  providerId: string,
+  slot: ModelSlot,
+  model: string,
+): void {
+  const path = configPath();
+  const dir = dirname(path);
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  const raw = readRawConfig();
+  const current = deepMerge(
+    DEFAULT_CONFIG as unknown as Record<string, unknown>,
+    raw,
+  ) as unknown as Config;
+  const providers = { ...migrateModelsConfig(raw, current.provider.active) };
+  const providerSlots = { ...(providers[providerId] ?? {}) };
+  const trimmed = model.trim();
+  if (!trimmed || trimmed === "default") delete providerSlots[slot];
+  else providerSlots[slot] = trimmed;
+  if (Object.keys(providerSlots).length > 0) providers[providerId] = providerSlots;
+  else delete providers[providerId];
+
+  const models = (current.models ?? {}) as Record<string, unknown>;
+  models.providers = providers;
+  delete models.main;
+  delete models.cheap;
+  delete models.roles;
+  delete models.picker;
+  delete models.lastUsed;
+  current.models = models as Config["models"];
+
+  const tmp = `${path}.tmp`;
+  writeFileSync(tmp, JSON.stringify(current, null, 2) + "\n", "utf8");
+  renameSync(tmp, path);
+  cachedConfig = undefined;
+}
+
+/** Deep-merge a partial patch into the persisted config file. Creates the file if absent. */
+export function saveConfig(patch: DeepPartial<Config>): void {
+  const path = configPath();
+  const dir = dirname(path);
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  const current = deepMerge(
+    DEFAULT_CONFIG as unknown as Record<string, unknown>,
+    readRawConfig(),
+  );
+  const next = deepMerge(current, patch as unknown as Record<string, unknown>);
+  const tmp = `${path}.tmp`;
+  writeFileSync(tmp, JSON.stringify(next, null, 2) + "\n", "utf8");
+  renameSync(tmp, path);
+  cachedConfig = undefined;
+}

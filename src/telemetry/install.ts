@@ -1,0 +1,201 @@
+import { loadConfig, type ModelPricing } from "../config/config.js";
+import type { HookRegistry } from "../hooks/types.js";
+import type { Usage } from "../provider/types.js";
+import { SessionCostAccumulator } from "./accumulator.js";
+import { calcCost } from "./cost.js";
+import { recordSpend, resetBudgetLedger } from "./budget.js";
+import { tokensSavedEstimated, resetTokensSaved } from "./tokens-saved.js";
+import type { LlmCallRecorder, MetricEvent, SessionCostSnapshot, TurnSource } from "./events.js";
+import { emitAll, flushAll, jsonlSink, sessionLogSink, stdoutSink, type MetricSink } from "./sinks.js";
+import { createOtelSpanConsumer, type OtelSpanConsumer } from "./otel/exporter.js";
+
+const now = () => new Date().toISOString();
+
+/** Whether the JSONL/stdout sinks are allowed. The session sink ignores this. */
+export function telemetryEnabled(): boolean {
+  return loadConfig().telemetry.enabled !== false;
+}
+
+/**
+ * Build the standard local sink list. The JSONL sink (and stdout when
+ * `telemetry.stdout` is true) are suppressed by the telemetry opt-out, but an
+ * injected session-log writer always gets a sink so the TUI/session record is
+ * unaffected by the opt-out.
+ */
+export function createDefaultSinks(opts: {
+  sessionWrite?: (event: MetricEvent) => void;
+} = {}): MetricSink[] {
+  const sinks: MetricSink[] = [];
+  if (telemetryEnabled()) {
+    sinks.push(jsonlSink(loadConfig().telemetry.metricsFile));
+    if (loadConfig().telemetry.stdout) sinks.push(stdoutSink());
+  }
+  if (opts.sessionWrite) sinks.push(sessionLogSink(opts.sessionWrite));
+  return sinks;
+}
+
+export interface InstallTelemetryOptions {
+  hooks: Pick<HookRegistry, "observe" | "on">;
+  sinks: readonly MetricSink[];
+  sessionId: string;
+  providerId?: string;
+  /** Pricing table override — defaults to `loadConfig().models.pricing`. */
+  pricing?: Record<string, ModelPricing>;
+  /** Called with a fresh snapshot after every turn (for the TUI badge, issue 8/8). */
+  onSessionCost?: (snapshot: SessionCostSnapshot) => void;
+  /**
+   * Seed the running totals from a prebuilt accumulator (issue 8/8). On resume
+   * the TUI rebuilds one from the session log (`rebuildSessionCost`) so the
+   * header total carries over before the next turn. When omitted, a fresh
+   * accumulator starts at zero.
+   */
+  accumulator?: SessionCostAccumulator;
+  /**
+   * OTLP span consumer override (issue 5/8). When omitted, one is built from
+   * the resolved OTel config (a no-op unless an endpoint is configured). Tests
+   * inject an InMemory-backed consumer here.
+   */
+  otel?: OtelSpanConsumer;
+}
+
+/** Handle returned by {@link installTelemetry}. */
+export interface InstalledTelemetry {
+  /** Unsubscribes every hook this install added. */
+  dispose: () => void;
+  /**
+   * Records a side-path LLM call (compaction, delegate_read) into this
+   * session's accumulator + sinks. Best-effort — never throws into the caller.
+   */
+  recordLlmCall: LlmCallRecorder;
+}
+
+/**
+ * Subscribe a session's hooks to the metric pipeline: each `assistant_message`
+ * becomes a `turn` metric (cost + tokens), each tool call a `tool` metric
+ * (duration keyed by call id, parallel-safe), and `session_end` a `session`
+ * summary followed by a flush. Returns a {@link InstalledTelemetry} handle with
+ * a disposer plus a recorder for side-path calls that bypass `runLoop`.
+ */
+export function installTelemetry(opts: InstallTelemetryOptions): InstalledTelemetry {
+  const { hooks, sinks, sessionId, providerId, onSessionCost } = opts;
+  const pricing = opts.pricing ?? loadConfig().models.pricing;
+  // A fresh session starts a fresh per-session budget run. Resumes rebuild the
+  // accumulator from the log but can't reconstruct pre-process spend, so the
+  // ledger only counts what this process actually ran since this install.
+  resetBudgetLedger();
+  resetTokensSaved();
+  const acc = opts.accumulator ?? new SessionCostAccumulator(sessionId);
+  const startMs = Date.now();
+  /** tool-call id → start time, so parallel calls measure their own duration. */
+  const toolStarts = new Map<string, number>();
+
+  // OTLP trace export (issue 5/8, revised #113). Undefined unless an endpoint
+  // is configured. Each turn_start/loop_end pair opens and closes a per-Q&A
+  // trace; session linkage is via session.id on the trace root.
+  const otel = opts.otel ?? createOtelSpanConsumer({ sessionId, providerId, pricing });
+
+  const unsubObserve = hooks.observe((event) => {
+    otel?.handleEvent(event);
+    if (event.type === "assistant_message") {
+      const { message } = event;
+      if (!message.usage) return;
+      const source: TurnSource = event.subagentId ? "subagent" : "main_loop";
+      const effectiveProvider = message.provider ?? providerId;
+      const breakdown = calcCost(message.model, message.usage, pricing, effectiveProvider);
+      recordSpend(breakdown.costUsd);
+      acc.recordTurn(breakdown, source);
+      emitAll(sinks, { type: "turn", sessionId, ts: now(), ...breakdown, source, provider: effectiveProvider });
+      if (onSessionCost) {
+        try {
+          onSessionCost(acc.snapshot());
+        } catch {
+          // A throwing consumer must never propagate into the agent loop.
+        }
+      }
+    } else if (event.type === "tool_start") {
+      toolStarts.set(event.id, Date.now());
+    } else if (event.type === "tool_end") {
+      const started = toolStarts.get(event.id);
+      toolStarts.delete(event.id);
+      const durationMs = started !== undefined ? Date.now() - started : 0;
+      emitAll(sinks, {
+        type: "tool",
+        sessionId,
+        ts: now(),
+        id: event.id,
+        name: event.name,
+        durationMs,
+        isError: event.isError,
+        subagentId: event.subagentId,
+      });
+    }
+  });
+
+  const unsubEnd = hooks.on("session_end", async (payload) => {
+    const summary = acc.finalize(Date.now() - startMs, payload.reason);
+    emitAll(sinks, {
+      type: "session",
+      sessionId,
+      ts: now(),
+      summary: { ...summary, tokensSaved: tokensSavedEstimated() },
+    });
+    if (otel) {
+      otel.endOpenTurn(payload.reason);
+      await otel.flush();
+    }
+    await flushAll(sinks);
+  });
+
+  const recordSideLlmCall: LlmCallRecorder = (call) => {
+    try {
+      recordLlmCall(acc, sinks, { ...call, providerId, pricing });
+    } catch {
+      // Best-effort: a telemetry failure must never break the caller
+      // (compaction / delegate_read).
+    }
+  };
+
+  return {
+    dispose: () => {
+      unsubObserve();
+      unsubEnd();
+      // /new and /resume reinstall without firing session_end, so close any
+      // open turn trace here too. Idempotent with the session_end path.
+      if (otel) {
+        otel.endOpenTurn("complete");
+        void otel.flush();
+      }
+    },
+    recordLlmCall: recordSideLlmCall,
+  };
+}
+
+/**
+ * Record an LLM call that doesn't surface as an `assistant_message` event —
+ * e.g. compaction or the cheap-model side path (issue 3/8). Updates the
+ * accumulator and emits a `turn` metric.
+ */
+export function recordLlmCall(
+  acc: SessionCostAccumulator,
+  sinks: readonly MetricSink[],
+  call: {
+    model: string;
+    usage: Usage;
+    source: TurnSource;
+    providerId?: string;
+    pricing?: Record<string, ModelPricing>;
+  },
+): void {
+  const pricing = call.pricing ?? loadConfig().models.pricing;
+  const breakdown = calcCost(call.model, call.usage, pricing, call.providerId);
+  recordSpend(breakdown.costUsd);
+  acc.recordTurn(breakdown, call.source);
+  emitAll(sinks, {
+    type: "turn",
+    sessionId: acc.sessionId,
+    ts: now(),
+    ...breakdown,
+    source: call.source,
+    provider: call.providerId,
+  });
+}

@@ -1,0 +1,50 @@
+import { z } from "zod";
+import { resolvePath } from "../util/paths.js";
+import { loadToolDescription } from "../util/load-txt.js";
+import {
+  MAX_DISCOVERY_OUTPUT_BYTES,
+  truncateDiscoveryOutput,
+  truncationNote,
+} from "./output-limits.js";
+import type { Tool } from "./types.js";
+
+const schema = z.object({
+  path: z.string().optional().describe("Directory to list (default: workspace root)"),
+});
+
+export type LsArgs = z.infer<typeof schema>;
+
+export const lsTool: Tool<LsArgs> = {
+  name: "ls",
+  description: loadToolDescription("ls"),
+  schema,
+  async execute({ path }, ctx) {
+    const dir = resolvePath(ctx.cwd, path ?? ".");
+    let raw = "";
+    const { exitCode, truncated } = await ctx.workspace.exec("ls -1p", dir, {
+      onData: (chunk) => {
+        raw += chunk.toString();
+      },
+      maxBuffer: MAX_DISCOVERY_OUTPUT_BYTES,
+    });
+    if (truncated) {
+      return { output: raw + truncationNote(MAX_DISCOVERY_OUTPUT_BYTES) };
+    }
+    if (exitCode !== 0) {
+      throw new Error(raw.trim() || `ls failed with exit ${exitCode}`);
+    }
+
+    const lines = raw
+      .split("\n")
+      .map((line) => line.replace(/\r$/, ""))
+      .filter((line) => line.length > 0)
+      .map((name) => {
+        const isDir = name.endsWith("/");
+        const label = isDir ? name.slice(0, -1) : name;
+        return `${isDir ? "d" : "f"} ${label}`;
+      })
+      .sort();
+
+    return { output: truncateDiscoveryOutput(lines.join("\n")) || "(empty)" };
+  },
+};

@@ -1,0 +1,115 @@
+import { execSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import * as os from "node:os";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { discoverSkills, parseSkillMeta } from "./discovery.js";
+
+function writeSkill(dir: string, name: string, description: string): void {
+  const skillDir = join(dir, name);
+  mkdirSync(skillDir, { recursive: true });
+  writeFileSync(
+    join(skillDir, "SKILL.md"),
+    `---\nname: ${name}\ndescription: ${description}\n---\n\nbody\n`,
+    "utf8",
+  );
+}
+
+describe("parseSkillMeta", () => {
+  it("parses a single-line description", () => {
+    const meta = parseSkillMeta(
+      "---\nname: my-skill\ndescription: A simple skill\n---\nbody\n",
+      "/fake/SKILL.md",
+      "/fake",
+    );
+    expect(meta?.description).toBe("A simple skill");
+  });
+
+  it("parses a YAML block literal description (|)", () => {
+    const meta = parseSkillMeta(
+      "---\nname: my-skill\ndescription: |\n  Break a bloated prompt into lean skills.\nversion: 1.0.0\n---\nbody\n",
+      "/fake/SKILL.md",
+      "/fake",
+    );
+    expect(meta?.description).toBe("Break a bloated prompt into lean skills.");
+  });
+
+  it("parses a YAML block folded description (>)", () => {
+    const meta = parseSkillMeta(
+      "---\nname: my-skill\ndescription: >\n  Line one.\n  Line two.\n---\nbody\n",
+      "/fake/SKILL.md",
+      "/fake",
+    );
+    expect(meta?.description).toBe("Line one. Line two.");
+  });
+
+  it("strips surrounding quotes from inline description", () => {
+    const meta = parseSkillMeta(
+      '---\nname: my-skill\ndescription: "A quoted skill."\n---\nbody\n',
+      "/fake/SKILL.md",
+      "/fake",
+    );
+    expect(meta?.description).toBe("A quoted skill.");
+  });
+});
+
+describe("discoverSkills", () => {
+  let root: string;
+
+  beforeEach(() => {
+    root = realpathSync(mkdtempSync(join(tmpdir(), "reever-skills-disc-")));
+    execSync("git init -q", { cwd: root });
+  });
+
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it("prefers .reever over .claude at the same directory level", () => {
+    writeSkill(join(root, ".reever", "skills"), "deploy", "reever deploy");
+    writeSkill(join(root, ".claude", "skills"), "deploy", "claude deploy");
+
+    const skills = discoverSkills(root);
+    expect(skills.find((s) => s.name === "deploy")?.description).toBe("reever deploy");
+  });
+
+  it("scans all .reever levels before any .claude level", () => {
+    const nested = join(root, "packages", "app");
+    mkdirSync(nested, { recursive: true });
+    writeSkill(join(root, ".claude", "skills"), "shared", "root claude");
+    writeSkill(join(nested, ".reever", "skills"), "shared", "nested reever");
+
+    const skills = discoverSkills(nested);
+    expect(skills.find((s) => s.name === "shared")?.description).toBe("nested reever");
+  });
+
+  it("loads user-global ~/.claude/skills when cwd is inside a git repo", () => {
+    const fakeHome = realpathSync(mkdtempSync(join(tmpdir(), "reever-skills-home-")));
+    writeSkill(join(fakeHome, ".claude", "skills"), "global-claude", "from home");
+
+    const homedirSpy = vi.spyOn(os, "homedir").mockReturnValue(fakeHome);
+    try {
+      const skills = discoverSkills(root);
+      expect(skills.find((s) => s.name === "global-claude")?.description).toBe("from home");
+    } finally {
+      homedirSpy.mockRestore();
+      rmSync(fakeHome, { recursive: true, force: true });
+    }
+  });
+
+  it("prefers project-local .claude over user-global ~/.claude/skills", () => {
+    const fakeHome = realpathSync(mkdtempSync(join(tmpdir(), "reever-skills-home-")));
+    writeSkill(join(fakeHome, ".claude", "skills"), "deploy", "global deploy");
+    writeSkill(join(root, ".claude", "skills"), "deploy", "project deploy");
+
+    const homedirSpy = vi.spyOn(os, "homedir").mockReturnValue(fakeHome);
+    try {
+      const skills = discoverSkills(root);
+      expect(skills.find((s) => s.name === "deploy")?.description).toBe("project deploy");
+    } finally {
+      homedirSpy.mockRestore();
+      rmSync(fakeHome, { recursive: true, force: true });
+    }
+  });
+});

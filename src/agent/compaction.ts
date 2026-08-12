@@ -1,0 +1,603 @@
+import { generateText } from "ai";
+import { z } from "zod";
+import { resolveLanguageModel } from "../provider/registry.js";
+import { getContextWindow } from "../provider/context-window.js";
+import { aiSdkUsageToUsage, type AiSdkUsage } from "../telemetry/cost.js";
+import type { LlmCallRecorder } from "../telemetry/events.js";
+import type { Message } from "../types.js";
+
+const COMPACT_THRESHOLD = 0.85;
+const DEFAULT_KEEP_LAST_K = 3;
+const DEFAULT_TOOL_RESULT_TOKEN_THRESHOLD = 2000;
+const DEFAULT_KEEP_LAST_N_TURNS = 20;
+/** Recent tool-output budget preserved when pruning under overflow (opencode-style). */
+const PRUNE_PROTECT_TOKENS = 40_000;
+/** Skip pruning when it would free fewer tokens than this. */
+const PRUNE_MINIMUM_TOKENS = 20_000;
+/** Hard cap on a single tool result when context is near the window. */
+const MAX_TOOL_RESULT_TOKENS = 16_000;
+/** Characters budget for each tool result embedded in a summarisation prompt (~5k tokens). */
+const SUMMARY_TOOL_RESULT_MAX_CHARS = 5_000 * 4;
+/** Message-level cut budget when turn-based summarisation cannot help (pi-style). */
+const DEFAULT_KEEP_RECENT_TOKENS = 20_000;
+/** Maximum number of progressive summarisation passes before giving up. */
+const MAX_COMPACT_ITERATIONS = 3;
+const ELIDED_PREFIX = "[result elided";
+
+/**
+ * The budgets above are absolute token counts tuned for large (~200k) windows.
+ * On a small window — e.g. a cheap explore subagent model with a 32k window —
+ * those absolutes can exceed the window itself, so pruning/eviction free
+ * nothing and the context never drops below the limit. The provider then
+ * rejects the oversized request and the (sub)agent loop throws (issue #183).
+ * Scaling each budget to a fraction of the live window guarantees compaction
+ * makes progress no matter how small the window, while leaving large windows
+ * untouched (the absolute is the floor of the two).
+ */
+function scaleToWindow(absolute: number, contextWindow: number, fraction: number): number {
+  return Math.max(1, Math.min(absolute, Math.floor(contextWindow * fraction)));
+}
+
+const SUMMARY_SYSTEM = (
+  "You compress conversation history for a coding agent. "
+  + "Produce a concise session summary preserving decisions, file paths, "
+  + "errors, and current task state. Use this structure:\n\n"
+  + "[Session summary — turns START–END]\n\n"
+  + "<summary paragraphs>\n"
+  + "Key decisions: ...\n"
+  + "Files read: ...\n"
+  + "Current working state: ..."
+);
+
+export interface TurnSlice {
+  turn: number;
+  start: number;
+  end: number;
+}
+
+/**
+ * Generate seam for summarisation. Takes the model *id* (not a resolved
+ * handle) so the default wrapper owns provider resolution; tests inject a mock
+ * and never touch a real provider (no credentials required).
+ */
+export type SummariseGenerate = (options: {
+  model: string;
+  system: string;
+  messages: Array<{ role: "user"; content: string }>;
+  maxOutputTokens: number;
+  abortSignal?: AbortSignal;
+}) => Promise<{ text: string; usage?: AiSdkUsage }>;
+
+const defaultSummariseGenerate: SummariseGenerate = ({ model, ...rest }) =>
+  generateText({ ...rest, model: resolveLanguageModel(model) });
+
+export function estimateMessageTokens(messages: Message[]): number {
+  let chars = 0;
+  for (const m of messages) {
+    for (const block of m.content) {
+      // Reasoning is kept for the UI but stripped by toAiMessages before the
+      // next provider call — do not count it toward compaction budgets (#379).
+      if (block.type === "text")
+        chars += block.text?.length ?? 0;
+      else if (block.type === "toolCall")
+        chars += block.name.length + JSON.stringify(block.arguments).length;
+      else if (block.type === "toolResult")
+        chars += block.output.length;
+    }
+  }
+  return Math.ceil(chars / 3.5);
+}
+
+export interface ToolSchemaEstimate {
+  name: string;
+  description: string;
+  schema: z.ZodType;
+}
+
+/** Fixed provider payload outside ctx.messages (system, tool schemas, injections). */
+export interface ProviderOverhead {
+  system?: string;
+  tools?: ToolSchemaEstimate[];
+  /** Extra tokens from before_prompt injections not stored in ctx.messages. */
+  injectionTokens?: number;
+}
+
+export function estimateSystemTokens(system?: string): number {
+  if (!system?.trim()) return 0;
+  return Math.ceil(system.length / 3.5);
+}
+
+export function estimateToolSchemaTokens(tools: ToolSchemaEstimate[]): number {
+  let chars = 0;
+  for (const t of tools) {
+    chars += t.name.length + t.description.length + 20;
+    try {
+      chars += JSON.stringify(z.toJSONSchema(t.schema)).length;
+    } catch {
+      chars += 200;
+    }
+  }
+  return Math.ceil(chars / 3.5);
+}
+
+export function estimateProviderOverhead(overhead: ProviderOverhead = {}): number {
+  return (
+    estimateSystemTokens(overhead.system)
+    + estimateToolSchemaTokens(overhead.tools ?? [])
+    + Math.max(0, overhead.injectionTokens ?? 0)
+  );
+}
+
+/** Message tokens plus fixed provider overhead — matches the next LLM request shape. */
+export function estimateProviderContextTokens(
+  messages: Message[],
+  overhead?: ProviderOverhead,
+): number {
+  return estimateMessageTokens(messages) + estimateProviderOverhead(overhead);
+}
+
+/** Tokens injected by before_prompt hooks that are not in ctx.messages. */
+export function estimateInjectionTokens(
+  promptMessages: Message[],
+  ctxMessages: Message[],
+): number {
+  return Math.max(0, estimateMessageTokens(promptMessages) - estimateMessageTokens(ctxMessages));
+}
+
+/** Fingerprint of prompt shape — invalidate cached usage when it changes (#380). */
+export function computePromptShapeKey(
+  system: string | undefined,
+  tools: Array<{ name: string }>,
+  promptMessages: Message[],
+  ctxMessages: Message[],
+): string {
+  const toolNames = tools.map((t) => t.name).sort().join(",");
+  const injection = estimateInjectionTokens(promptMessages, ctxMessages);
+  return `${system?.length ?? 0}:${toolNames}:${injection}`;
+}
+
+export interface ShouldCompactOptions {
+  knownTokens?: number;
+  overhead?: ProviderOverhead;
+}
+
+function resolveCompactionTokens(
+  messages: Message[],
+  options?: number | ShouldCompactOptions,
+): number {
+  const opts: ShouldCompactOptions = typeof options === "number"
+    ? { knownTokens: options > 0 ? options : undefined }
+    : (options ?? {});
+  const estimated = estimateProviderContextTokens(messages, opts.overhead);
+  const known = opts.knownTokens ?? 0;
+  // Prefer the higher of provider-reported usage and our estimate (#380): usage
+  // can be missing/stale or omit injections/tools; estimation can miss provider
+  // tokenizer quirks. Either signal that we're near the limit should compact.
+  return known > 0 ? Math.max(known, estimated) : estimated;
+}
+
+/**
+ * Returns true when the context is full enough to warrant compaction.
+ * Pass `knownTokens` (from the last API response's usage.input) for an exact
+ * count; omit it to fall back to character-based estimation. Include
+ * `overhead` (system, tool schemas, injections) so the check matches the
+ * actual provider payload (#371).
+ */
+export function shouldCompact(
+  messages: Message[],
+  windowSize: number,
+  options?: number | ShouldCompactOptions,
+): boolean {
+  return resolveCompactionTokens(messages, options) > windowSize * COMPACT_THRESHOLD;
+}
+
+export function sliceTurns(messages: Message[]): TurnSlice[] {
+  const slices: TurnSlice[] = [];
+  let turn = 0;
+  let start = 0;
+
+  for (let i = 0; i < messages.length; i++) {
+    if (messages[i]!.role !== "user") continue;
+    if (turn > 0) slices.push({ turn, start, end: i });
+    turn += 1;
+    start = i;
+  }
+
+  if (turn > 0) slices.push({ turn, start, end: messages.length });
+  return slices;
+}
+
+export function currentTurnCount(messages: Message[]): number {
+  return messages.filter((m) => m.role === "user").length;
+}
+
+function assignTurnIndices(messages: Message[]): number[] {
+  let turn = 0;
+  return messages.map((m) => {
+    if (m.role === "user") turn += 1;
+    return turn;
+  });
+}
+
+function estimateTokens(text: string): number {
+  return text.length / 4;
+}
+
+export function isElidedToolResult(text: string): boolean {
+  return text.startsWith(ELIDED_PREFIX);
+}
+
+function elideToolOutput(output: string): string {
+  const lines = output.split("\n").length;
+  return `[result elided — ${lines} lines. Re-run tool if needed.]`;
+}
+
+function mapToolResults(
+  messages: Message[],
+  fn: (output: string, block: Extract<Message["content"][number], { type: "toolResult" }>) => string,
+): Message[] {
+  return messages.map((msg) => {
+    if (msg.role !== "tool") return msg;
+    const content = msg.content.map((block) => {
+      if (block.type !== "toolResult") return block;
+      if (isElidedToolResult(block.output)) return block;
+      const next = fn(block.output, block);
+      return next === block.output ? block : { ...block, output: next };
+    });
+    const changed = content.some((block, i) => block !== msg.content[i]);
+    return changed ? { ...msg, content } : msg;
+  });
+}
+
+/** Cap individual bloated tool results when nearing the context window. */
+export function capOversizedToolResults(
+  messages: Message[],
+  contextWindow: number,
+  overhead?: ProviderOverhead,
+): Message[] {
+  const options = overhead ? { overhead } : undefined;
+  if (!shouldCompact(messages, contextWindow, options)) return messages;
+  const maxResult = scaleToWindow(MAX_TOOL_RESULT_TOKENS, contextWindow, 0.25);
+  return mapToolResults(messages, (output) =>
+    estimateTokens(output) > maxResult ? elideToolOutput(output) : output,
+  );
+}
+
+/**
+ * Walk backwards and elide older tool output once the recent budget is full.
+ * Works within a single user turn — unlike turn-based eviction.
+ */
+export function pruneOverflowToolResults(
+  messages: Message[],
+  contextWindow: number,
+  overhead?: ProviderOverhead,
+): Message[] {
+  const options = overhead ? { overhead } : undefined;
+  if (!shouldCompact(messages, contextWindow, options)) return messages;
+
+  const protectBudget = scaleToWindow(PRUNE_PROTECT_TOKENS, contextWindow, 0.5);
+  const minimumToPrune = scaleToWindow(PRUNE_MINIMUM_TOKENS, contextWindow, 0.25);
+  let protectedTokens = 0;
+  let prunedTokens = 0;
+  const elideIndices = new Set<number>();
+
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i]!;
+    if (msg.role !== "tool") continue;
+    for (const block of msg.content) {
+      if (block.type !== "toolResult") continue;
+      if (isElidedToolResult(block.output)) continue;
+      const tokens = estimateTokens(block.output);
+      if (protectedTokens + tokens <= protectBudget) {
+        protectedTokens += tokens;
+        continue;
+      }
+      prunedTokens += tokens;
+      elideIndices.add(i);
+    }
+  }
+
+  if (prunedTokens < minimumToPrune) return messages;
+
+  return messages.map((msg, index) => {
+    if (!elideIndices.has(index) || msg.role !== "tool") return msg;
+    const content = msg.content.map((block) => {
+      if (block.type !== "toolResult") return block;
+      if (isElidedToolResult(block.output)) return block;
+      return { ...block, output: elideToolOutput(block.output) };
+    });
+    return { ...msg, content };
+  });
+}
+
+function isValidCutPoint(msg: Message): boolean {
+  return msg.role === "user" || msg.role === "assistant";
+}
+
+/** Index of the first message to keep when preserving a recent token budget. */
+export function findMessageCutIndex(messages: Message[], keepRecentTokens: number): number {
+  const cutPoints: number[] = [];
+  for (let i = 0; i < messages.length; i++) {
+    if (isValidCutPoint(messages[i]!)) cutPoints.push(i);
+  }
+  if (cutPoints.length === 0) return messages.length;
+
+  let accumulated = 0;
+  for (let ci = cutPoints.length - 1; ci >= 0; ci--) {
+    const start = cutPoints[ci]!;
+    accumulated += estimateMessageTokens(messages.slice(start));
+    if (accumulated >= keepRecentTokens) return start;
+  }
+  return cutPoints[0] ?? 0;
+}
+
+/** Replace stale, large tool results with short stubs. Returns a new array. */
+export function evictStaleToolResults(
+  messages: Message[],
+  currentTurn: number,
+  keepLastK = DEFAULT_KEEP_LAST_K,
+  tokenThreshold = DEFAULT_TOOL_RESULT_TOKEN_THRESHOLD,
+): Message[] {
+  if (currentTurn <= keepLastK) return messages;
+
+  const cutoff = currentTurn - keepLastK;
+  const turnByIndex = assignTurnIndices(messages);
+
+  return messages.map((msg, index) => {
+    if (msg.role !== "tool") return msg;
+    if (turnByIndex[index]! > cutoff) return msg;
+
+    const content = msg.content.map((block) => {
+      if (block.type !== "toolResult") return block;
+      if (isElidedToolResult(block.output)) return block;
+      if (estimateTokens(block.output) <= tokenThreshold) return block;
+      return { ...block, output: elideToolOutput(block.output) };
+    });
+
+    return { ...msg, content };
+  });
+}
+
+export function stripReasoningBlocks(messages: Message[]): Message[] {
+  return messages.map((msg) => {
+    if (msg.role !== "assistant") return msg;
+    const content = msg.content.filter((block) => block.type !== "reasoning");
+    if (content.length === msg.content.length) return msg;
+    return { ...msg, content };
+  });
+}
+
+function truncateForSummary(output: string): string {
+  if (output.length <= SUMMARY_TOOL_RESULT_MAX_CHARS) return output;
+  const totalLines = output.split("\n").length;
+  return output.slice(0, SUMMARY_TOOL_RESULT_MAX_CHARS) + `\n[truncated for summary — ${totalLines} lines total]`;
+}
+
+function formatMessagesForSummary(messages: Message[]): string {
+  return messages
+    .map((m) => {
+      const parts = m.content.map((block) => {
+        if (block.type === "text") return block.text;
+        if (block.type === "reasoning") return "";
+        if (block.type === "toolCall") {
+          return `[tool_call ${block.name} ${JSON.stringify(block.arguments)}]`;
+        }
+        if (block.type === "toolResult") {
+          const prefix = block.isError ? "[tool_error]" : "[tool_result]";
+          return `${prefix} ${truncateForSummary(block.output)}`;
+        }
+        return "";
+      });
+      return `${m.role}: ${parts.join("\n")}`;
+    })
+    .join("\n\n");
+}
+
+function prefixTurnCount(totalTurns: number, keepLastN: number): number {
+  if (totalTurns <= 0) return 0;
+  if (totalTurns > keepLastN) return totalTurns - keepLastN;
+  return Math.floor(totalTurns / 2);
+}
+
+/** Split messages into groups where each group's formatted corpus fits within maxTokensPerChunk. */
+function chunkMessages(messages: Message[], maxTokensPerChunk: number): Message[][] {
+  const chunks: Message[][] = [];
+  let current: Message[] = [];
+  let currentTokens = 0;
+
+  for (const msg of messages) {
+    const t = estimateMessageTokens([msg]);
+    if (current.length > 0 && currentTokens + t > maxTokensPerChunk) {
+      chunks.push(current);
+      current = [msg];
+      currentTokens = t;
+    } else {
+      current.push(msg);
+      currentTokens += t;
+    }
+  }
+
+  if (current.length > 0) chunks.push(current);
+  return chunks;
+}
+
+async function callGenerate(
+  prompt: string,
+  model: string,
+  maxOutputTokens: number,
+  generate: SummariseGenerate,
+  recordCall: LlmCallRecorder | undefined,
+  signal: AbortSignal | undefined,
+): Promise<string> {
+  const { text, usage } = await generate({
+    model,
+    system: SUMMARY_SYSTEM,
+    messages: [{ role: "user", content: prompt }],
+    maxOutputTokens,
+    abortSignal: signal,
+  });
+  if (recordCall && usage) {
+    recordCall({ model, usage: aiSdkUsageToUsage(usage), source: "compaction" });
+  }
+  return text.trim();
+}
+
+/** Summarise older turns into one assistant message; keep recent turns verbatim. */
+export async function summariseOldTurns(
+  messages: Message[],
+  model: string,
+  keepLastN = DEFAULT_KEEP_LAST_N_TURNS,
+  generate: SummariseGenerate = defaultSummariseGenerate,
+  recordCall?: LlmCallRecorder,
+  cheapWindow?: number,
+  originalMessages?: Message[],
+  signal?: AbortSignal,
+): Promise<Message[]> {
+  const turns = sliceTurns(messages);
+  const prefixTurns = prefixTurnCount(turns.length, keepLastN);
+  if (prefixTurns <= 0) return messages;
+
+  const splitAt = turns[prefixTurns - 1]!.end;
+  const sourceForCorpus = originalMessages ?? messages;
+  const oldMessages = stripReasoningBlocks(sourceForCorpus.slice(0, splitAt));
+  const recentMessages = messages.slice(splitAt);
+  if (oldMessages.length === 0) return messages;
+
+  const startTurn = turns[0]!.turn;
+  const endTurn = turns[prefixTurns - 1]!.turn;
+  const corpus = formatMessagesForSummary(oldMessages);
+
+  const resolvedCheapWindow = cheapWindow ?? await getContextWindow(model);
+  const maxCorpusTokens = Math.floor(resolvedCheapWindow * 0.75);
+
+  let summaryText: string;
+  try {
+    if (corpus.length / 4 <= maxCorpusTokens) {
+      summaryText = await callGenerate(
+        `Summarise turns ${startTurn}–${endTurn} of this coding-agent session:\n\n${corpus}`,
+        model, 4096, generate, recordCall, signal,
+      );
+    } else {
+      // Corpus too large for the cheap model in one pass — chunk and summarise each piece.
+      const maxChunkTokens = Math.floor(maxCorpusTokens * 0.8);
+      const parts: string[] = [];
+      for (const chunk of chunkMessages(oldMessages, maxChunkTokens)) {
+        const chunkCorpus = formatMessagesForSummary(chunk);
+        parts.push(await callGenerate(
+          `Summarise this portion of a coding-agent session:\n\n${chunkCorpus}`,
+          model, 2048, generate, recordCall, signal,
+        ));
+      }
+      summaryText = parts.join("\n\n");
+    }
+  } catch (err) {
+    console.warn("[compaction] summariseOldTurns failed, skipping compaction:", err);
+    return messages;
+  }
+
+  const summaryMessage: Message = {
+    role: "assistant",
+    content: [{ type: "text", text: summaryText }],
+  };
+
+  return [summaryMessage, ...recentMessages];
+}
+
+/** Summarise older messages when turn boundaries cannot split the context (single-turn sessions). */
+export async function summariseOldMessages(
+  messages: Message[],
+  model: string,
+  keepRecentTokens = DEFAULT_KEEP_RECENT_TOKENS,
+  generate: SummariseGenerate = defaultSummariseGenerate,
+  recordCall?: LlmCallRecorder,
+  cheapWindow?: number,
+  originalMessages?: Message[],
+  signal?: AbortSignal,
+): Promise<Message[]> {
+  const cutIndex = findMessageCutIndex(messages, keepRecentTokens);
+  if (cutIndex <= 0) return messages;
+
+  const sourceForCorpus = originalMessages ?? messages;
+  const oldMessages = stripReasoningBlocks(sourceForCorpus.slice(0, cutIndex));
+  const recentMessages = messages.slice(cutIndex);
+  if (oldMessages.length === 0) return messages;
+
+  const corpus = formatMessagesForSummary(oldMessages);
+
+  const resolvedCheapWindow = cheapWindow ?? await getContextWindow(model);
+  const maxCorpusTokens = Math.floor(resolvedCheapWindow * 0.75);
+
+  let summaryText: string;
+  try {
+    if (corpus.length / 4 <= maxCorpusTokens) {
+      summaryText = await callGenerate(
+        `Summarise this portion of a coding-agent session:\n\n${corpus}`,
+        model, 4096, generate, recordCall, signal,
+      );
+    } else {
+      // Corpus too large for the cheap model in one pass — chunk and summarise each piece.
+      const maxChunkTokens = Math.floor(maxCorpusTokens * 0.8);
+      const parts: string[] = [];
+      for (const chunk of chunkMessages(oldMessages, maxChunkTokens)) {
+        const chunkCorpus = formatMessagesForSummary(chunk);
+        parts.push(await callGenerate(
+          `Summarise this portion of a coding-agent session:\n\n${chunkCorpus}`,
+          model, 2048, generate, recordCall, signal,
+        ));
+      }
+      summaryText = parts.join("\n\n");
+    }
+  } catch (err) {
+    console.warn("[compaction] summariseOldMessages failed, skipping compaction:", err);
+    return messages;
+  }
+
+  const summaryMessage: Message = {
+    role: "assistant",
+    content: [{ type: "text", text: summaryText }],
+  };
+
+  return [summaryMessage, ...recentMessages];
+}
+
+/**
+ * Full auto-compact pipeline: cap/prune tool output, then summarise by turn or
+ * by message cut when a single turn has grown too large.
+ */
+export async function compactMessages(
+  messages: Message[],
+  model: string,
+  contextWindow: number,
+  keepLastNTurns = DEFAULT_KEEP_LAST_N_TURNS,
+  generate: SummariseGenerate = defaultSummariseGenerate,
+  recordCall?: LlmCallRecorder,
+  signal?: AbortSignal,
+  overhead?: ProviderOverhead,
+): Promise<Message[]> {
+  const compactOptions = overhead ? { overhead } : undefined;
+  const originalMessages = messages;
+  let result = capOversizedToolResults(messages, contextWindow, overhead);
+  result = pruneOverflowToolResults(result, contextWindow, overhead);
+  if (!shouldCompact(result, contextWindow, compactOptions)) return result;
+
+  // Resolve the cheap model's window once to avoid duplicate lookups.
+  const cheapWindow = await getContextWindow(model);
+
+  result = await summariseOldTurns(result, model, keepLastNTurns, generate, recordCall, cheapWindow, originalMessages, signal);
+  if (!shouldCompact(result, contextWindow, compactOptions)) return result;
+
+  let keepRecent = scaleToWindow(DEFAULT_KEEP_RECENT_TOKENS, contextWindow, 0.4);
+  for (let iter = 0; iter < MAX_COMPACT_ITERATIONS; iter++) {
+    // A mid-flight cancel aborts the in-progress summarise call above; bail
+    // before re-issuing generate calls that would only abort again.
+    if (signal?.aborted) break;
+    result = await summariseOldMessages(
+      result, model, keepRecent, generate, recordCall, cheapWindow,
+      iter === 0 ? originalMessages : undefined,
+      signal,
+    );
+    if (!shouldCompact(result, contextWindow, compactOptions)) break;
+    keepRecent = Math.max(1, Math.floor(keepRecent / 2));
+  }
+  return result;
+}
