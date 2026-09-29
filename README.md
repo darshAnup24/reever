@@ -26,13 +26,6 @@ static allow/deny lists — process-level configuration, not per-turn relevance
 ranking. Built-in **A/B testing** (`tool_pool=ratel` vs `tool_pool=default`) lets
 you measure the impact directly in your telemetry.
 
-### E2B OS-level sandboxing
-
-opencode, pi.dev, and Claude Code enforce safety through permission rules and
-allow/deny lists — process-level controls that still run on your host. Reever's
-`sandbox` isolation mode runs subagents in **E2B ephemeral cloud VMs**: the
-subagent is fully isolated from your filesystem regardless of what it executes.
-For untrusted tasks, that's a real isolation boundary, not a policy.
 
 ### Shadow-git `/undo` with broader bash coverage
 
